@@ -1,0 +1,157 @@
+name: Build IPA From Upstream
+
+# 用途：仓库不是你的时候用。
+# 放到你自己任意一个仓库（甚至空仓库）的 .github/workflows/build-ipa.yml，
+# 它会自己去拉 Axixi2233/moonlight-ios 的代码并构建，你完全不碰别人的仓库。
+# public 仓库的 macOS runner 不计量；private 仓库按分钟计费（macOS ×10 倍率）。
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: '上游分支或 tag（默认 master）'
+        required: false
+        default: 'master'
+      bundle_id:
+        description: 'Bundle ID（留空用工程里的 cn.axi.moonlight.ap1）'
+        required: false
+        default: ''
+      configuration:
+        description: '构建配置'
+        required: true
+        default: 'Release'
+        type: choice
+        options:
+          - Release
+          - Debug
+
+concurrency:
+  group: build-ipa-upstream
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # macos-14 已于 2026-11-02 退役，会报 "configuration is not supported"
+    # macos-15 = Xcode 16.x，当前免费可用的标准 macOS 标签
+    runs-on: macos-15
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: src
+
+    steps:
+      - name: 拉取上游仓库（含子模块）
+        uses: actions/checkout@v4
+        with:
+          repository: Axixi2233/moonlight-ios
+          ref: ${{ inputs.upstream_ref }}
+          submodules: recursive
+          fetch-depth: 1
+          path: src
+
+      - name: 确认代码完整
+        run: |
+          set -e
+          echo "HEAD: $(git rev-parse --short HEAD)  $(git log -1 --format=%s)"
+          test -f Moonlight.xcodeproj/project.pbxproj || { echo "工程文件缺失"; exit 1; }
+          test -f moonlight-common/moonlight-common-c/src/stream.cpp || { echo "moonlight-common-c 子模块缺失"; exit 1; }
+          test -f X1Kit/Sources/X1Kit/X1Kit.swift || { echo "X1Kit 子模块缺失"; exit 1; }
+          ls libs/FFmpeg/lib/iOS libs/opus/lib/iOS libs/SDL2/lib/iOS
+          echo "代码完整"
+
+      - name: 工具链 / 工程结构
+        run: |
+          xcodebuild -version
+          sw_vers
+          xcodebuild -list -project Moonlight.xcodeproj -json | tee project-list.json
+
+      - name: 构建（禁用代码签名）
+        env:
+          CONFIG: ${{ inputs.configuration }}
+          NEW_BUNDLE_ID: ${{ inputs.bundle_id }}
+        run: |
+          set -o pipefail
+          ARGS=(-project Moonlight.xcodeproj -configuration "$CONFIG" -sdk iphoneos -derivedDataPath build)
+          if python3 -c 'import json,sys; d=json.load(open("project-list.json"))["project"]; sys.exit(0 if "Moonlight" in d.get("schemes", []) else 1)'
+          then
+            echo "使用 -scheme Moonlight"
+            ARGS+=(-scheme Moonlight -destination 'generic/platform=iOS')
+          else
+            echo "无 shared scheme，使用 -target Moonlight"
+            ARGS+=(-target Moonlight)
+          fi
+
+          EXTRA=()
+          if [ -n "$NEW_BUNDLE_ID" ]; then
+            EXTRA+=("PRODUCT_BUNDLE_IDENTIFIER=$NEW_BUNDLE_ID")
+          fi
+
+          set +e
+          xcodebuild "${ARGS[@]}" \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS="" \
+            DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            "${EXTRA[@]}" \
+            clean build 2>&1 | tee xcodebuild.log
+          STATUS=${PIPESTATUS[0]}
+          set -e
+
+          grep -E "error:|\*\* BUILD (SUCCEEDED|FAILED) \*\*" xcodebuild.log | tail -30 || true
+          exit $STATUS
+
+      - name: 打包 ipa + 自检
+        env:
+          CONFIG: ${{ inputs.configuration }}
+        run: |
+          set -e
+          APP_DIR="build/Build/Products/${CONFIG}-iphoneos"
+          APP=$(find "$APP_DIR" -maxdepth 1 -name "*.app" | head -1)
+          echo "APP = $APP"
+          test -d "$APP" || { echo "找不到 .app"; exit 1; }
+
+          rm -rf out && mkdir -p out/Payload
+          cp -R "$APP" out/Payload/
+
+          find out/Payload -name "_CodeSignature" -type d -prune -exec rm -rf {} + 2>/dev/null || true
+          find out/Payload -name "embedded.mobileprovision" -delete 2>/dev/null || true
+
+          APPNAME=$(basename "$APP" .app)
+          IPA_NAME="${APPNAME}-unsigned-${CONFIG}.ipa"
+          IPA="out/${IPA_NAME}"
+          ( cd out && zip -qry "$IPA_NAME" Payload )
+
+          ls -lh "$IPA"
+          echo "--- 架构 ---"
+          file "$APP/$APPNAME"
+          echo "--- 签名状态 ---"
+          codesign -dv "$APP/$APPNAME" 2>&1 | head -5 || true
+          echo "--- 包信息 ---"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP/Info.plist" || true
+          /usr/libexec/PlistBuddy -c "Print :MinimumOSVersion" "$APP/Info.plist" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Print :CFBundleDisplayName" "$APP/Info.plist" 2>/dev/null || true
+
+      - name: 上传 ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: moonlight-ipa-${{ inputs.configuration }}
+          path: |
+            src/out/*.ipa
+            src/xcodebuild.log
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: 失败时保留日志
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            src/xcodebuild.log
+            src/project-list.json
+          if-no-files-found: ignore
+          retention-days: 7
